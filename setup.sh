@@ -832,6 +832,15 @@ cat >/etc/cron.d/xp_all <<-END
 		PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 		2 0 * * * root /usr/local/sbin/xp
 	END
+	# SSH expiry is enforced on its own schedule. xp only runs once a day, so
+	# an expired account could stay online for up to 24 hours. expkill is a
+	# cheap read of /etc/shadow (it does not touch xray), so it runs every
+	# minute and disconnects expired users as soon as they expire.
+	cat >/etc/cron.d/expkill <<-END
+		SHELL=/bin/sh
+		PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+		*/1 * * * * root /usr/local/sbin/expkill --quiet
+	END
 	cat >/etc/cron.d/logclean <<-END
 		SHELL=/bin/sh
 		PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
