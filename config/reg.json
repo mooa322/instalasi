@@ -23,5 +23,10 @@
     "ip": "130.94.57.194",
     "issued": "2026-08-19",
     "revoked": false
+  },
+  "kinglion": {
+    "ip": "85.190.99.80",
+    "issued": "2026-08-21",
+    "revoked": false
   }
 }
