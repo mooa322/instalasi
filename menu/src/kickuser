@@ -1,0 +1,179 @@
+#!/bin/bash
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  kickuser — force-disconnect an SSH account's LIVE sessions.
+#
+#  Why this script exists
+#  ---------------------
+#  Locking an account (`passwd -l` / `usermod -L`) or changing its
+#  password only blocks the *next* login. sshd and dropbear read the
+#  account's credentials once, at authentication time, and never look
+#  at /etc/shadow again for the life of that connection. So a session
+#  that is already established keeps running exactly as before — the
+#  user stays online.
+#
+#  `userdel -f` does not help either: it removes the account from
+#  /etc/passwd but explicitly does NOT terminate the processes that
+#  belong to it. The session simply keeps running under an orphaned UID.
+#
+#  `service ssh restart` does not help either: sshd forks a separate
+#  child process per connection. Restarting the master listener only
+#  replaces the process that accepts NEW connections; every established
+#  child survives.
+#
+#  The only thing that actually drops a live session is killing the
+#  processes serving it. That is what this script does.
+#
+#  usage: kickuser <username> [--lock] [--delete] [--quiet]
+#         --lock     lock the account first, so it cannot log back in
+#         --delete   userdel the account after the sessions are gone
+#         --quiet    no output (for cron)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TARGET=""
+DO_LOCK=0
+DO_DELETE=0
+QUIET=0
+
+for arg in "$@"; do
+	case "$arg" in
+		--lock)   DO_LOCK=1 ;;
+		--delete) DO_DELETE=1 ;;
+		--quiet)  QUIET=1 ;;
+		-*)       ;;
+		*)        [ -z "$TARGET" ] && TARGET="$arg" ;;
+	esac
+done
+
+say() { [ "$QUIET" -eq 1 ] || echo -e "$*"; }
+
+if [ -z "$TARGET" ]; then
+	echo "usage: kickuser <username> [--lock] [--delete] [--quiet]"
+	exit 1
+fi
+
+# Usernames come from /etc/shadow and from menu prompts. Refuse anything
+# that is not a plain account name so it can never reach a regex or a
+# kill list as something else.
+case "$TARGET" in
+	*[!A-Za-z0-9._-]*)
+		say "kickuser: invalid username '$TARGET'"
+		exit 1
+		;;
+esac
+
+UID_TARGET="$(id -u "$TARGET" 2>/dev/null)"
+
+# Recovery path for accounts the old buggy code already removed with
+# `userdel -f`: the passwd entry is gone but the session is still running
+# under a now-nameless numeric UID. userdel does not remove the home
+# directory unless asked, so it still carries the original owner UID.
+# Only trust it while no live account has been given that UID since,
+# otherwise we would kill a different, innocent user.
+if [ -z "$UID_TARGET" ] && [ -d "/home/$TARGET" ]; then
+	ORPHAN_UID="$(stat -c %u "/home/$TARGET" 2>/dev/null)"
+	if [ -n "$ORPHAN_UID" ] && [ "$ORPHAN_UID" -ge 1000 ] 2>/dev/null; then
+		if ! cut -d: -f3 /etc/passwd | grep -qx "$ORPHAN_UID"; then
+			UID_TARGET="$ORPHAN_UID"
+		fi
+	fi
+fi
+
+# Never touch root or a system account, even by mistake.
+if [ -n "$UID_TARGET" ] && [ "$UID_TARGET" -lt 1000 ]; then
+	say "kickuser: refusing to kick system account '$TARGET' (uid $UID_TARGET)"
+	exit 1
+fi
+
+if [ -e "/var/log/auth.log" ]; then
+	LOG="/var/log/auth.log"
+elif [ -e "/var/log/secure" ]; then
+	LOG="/var/log/secure"
+else
+	LOG=""
+fi
+
+# ── 1. Close the door before emptying the room ──────────────────────
+# Locking first means the client cannot simply reconnect in the
+# fraction of a second between the kill and the account removal.
+if [ "$DO_LOCK" -eq 1 ] && [ -n "$UID_TARGET" ]; then
+	usermod -L "$TARGET" >/dev/null 2>&1
+fi
+
+# ── 2. Collect every process that serves this account ───────────────
+collect_pids() {
+	local pids="" pid
+
+	# (a) Everything owned by the account. After authentication sshd
+	#     drops privileges, so this catches `sshd: user@pts/0`, the
+	#     unprivileged network child, the login shell, and any
+	#     port-forwarding helper the client started.
+	if [ -n "$UID_TARGET" ]; then
+		pids="$pids $(pgrep -U "$UID_TARGET" 2>/dev/null | tr '\n' ' ')"
+	fi
+
+	# (b) The privilege-separation monitor, `sshd: user [priv]`. It stays
+	#     root-owned, so (a) never sees it. Matching on the process title
+	#     is anchored so that user "ali" cannot match "alice".
+	#     OpenSSH >= 9.8 renamed the per-session binary to sshd-session.
+	pids="$pids $(pgrep -f "^sshd(-session|-auth)?: ${TARGET}( |@|$)" 2>/dev/null | tr '\n' ' ')"
+
+	# (c) Dropbear keeps one process per connection and does not put the
+	#     username in the process title, so map PID -> user via the auth log.
+	if [ -n "$LOG" ]; then
+		for pid in $(pgrep -x dropbear 2>/dev/null); do
+			if grep -qE "dropbear\[$pid\]:.*auth succeeded for '?${TARGET}'?" "$LOG" 2>/dev/null; then
+				pids="$pids $pid"
+			fi
+		done
+	fi
+
+	# (d) Children of everything matched above — a login shell or a
+	#     forwarding helper left behind when its parent is killed.
+	for pid in $(echo "$pids" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -un); do
+		pids="$pids $(pgrep -P "$pid" 2>/dev/null | tr '\n' ' ')"
+	done
+
+	# Deduplicate and never include ourselves, our parent, or init.
+	echo "$pids" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -un | \
+		grep -vxE "$$|$PPID|1"
+}
+
+signal_all() {
+	local sig="$1" pids
+	pids="$(collect_pids | tr '\n' ' ')"
+	[ -z "${pids// /}" ] && return 1
+	kill "-$sig" $pids >/dev/null 2>&1
+	return 0
+}
+
+# ── 3. Terminate, then make sure ────────────────────────────────────
+if signal_all TERM; then
+	say "kickuser: sent SIGTERM to sessions of '$TARGET'"
+	sleep 1
+fi
+
+if signal_all KILL; then
+	say "kickuser: sent SIGKILL to remaining sessions of '$TARGET'"
+fi
+
+# systemd-logind keeps its own view of the session; ask it to tear
+# down anything the signals above did not reach.
+if command -v loginctl >/dev/null 2>&1; then
+	loginctl terminate-user "$TARGET" >/dev/null 2>&1
+fi
+
+# ── 4. Report / delete ──────────────────────────────────────────────
+LEFT="$(collect_pids | tr '\n' ' ')"
+if [ -n "${LEFT// /}" ]; then
+	say "kickuser: WARNING, still alive after SIGKILL: $LEFT"
+else
+	say "kickuser: '$TARGET' has no live session left"
+fi
+
+if [ "$DO_DELETE" -eq 1 ] && [ -n "$UID_TARGET" ]; then
+	# Sessions are gone first, so userdel has nothing to trip over.
+	userdel -f "$TARGET" >/dev/null 2>&1
+	say "kickuser: account '$TARGET' removed"
+fi
+
+exit 0
